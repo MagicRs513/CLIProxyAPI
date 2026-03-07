@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -16,6 +18,7 @@ type keysTabModel struct {
 	client   *Client
 	viewport viewport.Model
 	keys     []string
+	settings map[string]apiKeyPolicy
 	gemini   []map[string]any
 	claude   []map[string]any
 	codex    []map[string]any
@@ -36,8 +39,14 @@ type keysTabModel struct {
 	editInput textinput.Model
 }
 
+type apiKeyPolicy struct {
+	ExpiresAt  string
+	TokenLimit int64
+}
+
 type keysDataMsg struct {
 	apiKeys []string
+	policy  []map[string]any
 	gemini  []map[string]any
 	claude  []map[string]any
 	codex   []map[string]any
@@ -74,6 +83,7 @@ func (m keysTabModel) fetchKeys() tea.Msg {
 		return result
 	}
 	result.apiKeys = apiKeys
+	result.policy, _ = m.client.GetAPIKeySettings()
 	result.gemini, _ = m.client.GetGeminiKeys()
 	result.claude, _ = m.client.GetClaudeKeys()
 	result.codex, _ = m.client.GetCodexKeys()
@@ -93,6 +103,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		} else {
 			m.err = nil
 			m.keys = msg.apiKeys
+			m.settings = toPolicyMap(msg.policy)
 			m.gemini = msg.gemini
 			m.claude = msg.claude
 			m.codex = msg.codex
@@ -120,16 +131,26 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		if m.editing || m.adding {
 			switch msg.String() {
 			case "enter":
-				value := strings.TrimSpace(m.editInput.Value())
-				if value == "" {
+				raw := strings.TrimSpace(m.editInput.Value())
+				if raw == "" {
 					m.editing = false
 					m.adding = false
 					m.editInput.Blur()
 					m.viewport.SetContent(m.renderContent())
 					return m, nil
 				}
+				value, policy, hasPolicy, parseErr := parseKeyInput(raw)
+				if parseErr != nil {
+					m.status = errorStyle.Render("✗ " + parseErr.Error())
+					m.viewport.SetContent(m.renderContent())
+					return m, nil
+				}
 				isAdding := m.adding
 				editIdx := m.editIdx
+				oldKey := ""
+				if editIdx >= 0 && editIdx < len(m.keys) {
+					oldKey = m.keys[editIdx]
+				}
 				m.editing = false
 				m.adding = false
 				m.editInput.Blur()
@@ -139,6 +160,11 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 						if err != nil {
 							return keyActionMsg{err: err}
 						}
+						if hasPolicy {
+							if err = reconcileAPIKeyPolicy(m.client, "", value, &policy); err != nil {
+								return keyActionMsg{err: err}
+							}
+						}
 						return keyActionMsg{action: T("key_added")}
 					}
 				}
@@ -146,6 +172,11 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 					err := m.client.EditAPIKey(editIdx, value)
 					if err != nil {
 						return keyActionMsg{err: err}
+					}
+					if hasPolicy || oldKey != value {
+						if err = reconcileAPIKeyPolicy(m.client, oldKey, value, policyOrNil(hasPolicy, policy)); err != nil {
+							return keyActionMsg{err: err}
+						}
 					}
 					return keyActionMsg{action: T("key_updated")}
 				}
@@ -309,6 +340,18 @@ func (m keysTabModel) renderContent() string {
 		}
 
 		row := fmt.Sprintf("%s%d. %s", cursor, i+1, maskKey(key))
+		if policy, ok := m.settings[key]; ok {
+			parts := make([]string, 0, 2)
+			if policy.ExpiresAt != "" {
+				parts = append(parts, "exp: "+policy.ExpiresAt)
+			}
+			if policy.TokenLimit > 0 {
+				parts = append(parts, "token-limit: "+strconv.FormatInt(policy.TokenLimit, 10))
+			}
+			if len(parts) > 0 {
+				row += " [" + strings.Join(parts, ", ") + "]"
+			}
+		}
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
@@ -402,4 +445,129 @@ func maskKey(key string) string {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
+}
+
+func parseKeyInput(raw string) (string, apiKeyPolicy, bool, error) {
+	parts := strings.Split(raw, "|")
+	key := strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", apiKeyPolicy{}, false, fmt.Errorf("API key is required")
+	}
+	if len(parts) == 1 {
+		return key, apiKeyPolicy{}, false, nil
+	}
+
+	policy := apiKeyPolicy{}
+	for i := 1; i < len(parts); i++ {
+		segment := strings.TrimSpace(parts[i])
+		if segment == "" {
+			continue
+		}
+		kv := strings.SplitN(segment, "=", 2)
+		if len(kv) != 2 {
+			return "", apiKeyPolicy{}, false, fmt.Errorf("invalid policy segment: %s", segment)
+		}
+		name := strings.ToLower(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+		switch name {
+		case "expires", "expire", "expires-at":
+			policy.ExpiresAt = value
+		case "tokens", "token-limit", "quota":
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || v < 0 {
+				return "", apiKeyPolicy{}, false, fmt.Errorf("invalid token limit")
+			}
+			policy.TokenLimit = v
+		default:
+			return "", apiKeyPolicy{}, false, fmt.Errorf("unknown policy field: %s", name)
+		}
+	}
+	if policy.ExpiresAt == "" && policy.TokenLimit == 0 {
+		return key, apiKeyPolicy{}, false, nil
+	}
+	return key, policy, true, nil
+}
+
+func policyOrNil(hasPolicy bool, policy apiKeyPolicy) *apiKeyPolicy {
+	if !hasPolicy {
+		return nil
+	}
+	copy := policy
+	return &copy
+}
+
+func reconcileAPIKeyPolicy(client *Client, oldKey, newKey string, explicit *apiKeyPolicy) error {
+	if client == nil {
+		return nil
+	}
+	items, err := client.GetAPIKeySettings()
+	if err != nil {
+		return err
+	}
+	policies := toPolicyMap(items)
+	if policies == nil {
+		policies = map[string]apiKeyPolicy{}
+	}
+
+	oldKey = strings.TrimSpace(oldKey)
+	newKey = strings.TrimSpace(newKey)
+	if oldKey != "" && oldKey != newKey {
+		if policy, ok := policies[oldKey]; ok && explicit == nil {
+			policies[newKey] = policy
+		}
+		delete(policies, oldKey)
+	}
+
+	if explicit != nil {
+		if explicit.ExpiresAt == "" && explicit.TokenLimit == 0 {
+			delete(policies, newKey)
+		} else {
+			policies[newKey] = *explicit
+		}
+	}
+
+	keys := make([]string, 0, len(policies))
+	for key := range policies {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	payload := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		policy := policies[key]
+		entry := map[string]any{"api-key": key}
+		if policy.ExpiresAt != "" {
+			entry["expires-at"] = policy.ExpiresAt
+		}
+		if policy.TokenLimit > 0 {
+			entry["token-limit"] = policy.TokenLimit
+		}
+		payload = append(payload, entry)
+	}
+
+	return client.PutAPIKeySettings(payload)
+}
+
+func toPolicyMap(items []map[string]any) map[string]apiKeyPolicy {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make(map[string]apiKeyPolicy, len(items))
+	for _, item := range items {
+		apiKey := getString(item, "api-key")
+		if apiKey == "" {
+			continue
+		}
+		policy := apiKeyPolicy{ExpiresAt: getString(item, "expires-at")}
+		switch raw := item["token-limit"].(type) {
+		case float64:
+			policy.TokenLimit = int64(raw)
+		case int64:
+			policy.TokenLimit = raw
+		case int:
+			policy.TokenLimit = int64(raw)
+		}
+		out[apiKey] = policy
+	}
+	return out
 }

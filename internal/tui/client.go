@@ -289,6 +289,35 @@ func (c *Client) DeleteAPIKey(index int) error {
 	return nil
 }
 
+// GetAPIKeySettings fetches optional policy constraints for client API keys.
+func (c *Client) GetAPIKeySettings() ([]map[string]any, error) {
+	return c.getWrappedKeyList("/v0/management/api-key-settings", "api-key-settings")
+}
+
+// PutAPIKeySettings replaces all API key policy settings.
+func (c *Client) PutAPIKeySettings(items []map[string]any) error {
+	body, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+	_, err = c.put("/v0/management/api-key-settings", strings.NewReader(string(body)))
+	return err
+}
+
+// DeleteAPIKeySetting removes a setting by api-key.
+func (c *Client) DeleteAPIKeySetting(apiKey string) error {
+	query := url.Values{}
+	query.Set("api-key", apiKey)
+	_, code, err := c.doRequest("DELETE", "/v0/management/api-key-settings?"+query.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	if code >= 400 {
+		return fmt.Errorf("delete failed (HTTP %d)", code)
+	}
+	return nil
+}
+
 // GetGeminiKeys fetches Gemini API keys.
 // API returns {"gemini-api-key": [...]}.
 func (c *Client) GetGeminiKeys() ([]map[string]any, error) {

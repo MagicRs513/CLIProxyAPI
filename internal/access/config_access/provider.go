@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
@@ -22,18 +24,27 @@ func Register(cfg *sdkconfig.SDKConfig) {
 		return
 	}
 
+	settings := normalizeKeySettings(cfg.APIKeySettings)
+
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
+		newProvider(sdkaccess.DefaultAccessProviderName, keys, settings),
 	)
+}
+
+type keySetting struct {
+	expiresAt  time.Time
+	tokenLimit int64
 }
 
 type provider struct {
 	name string
 	keys map[string]struct{}
+
+	settings map[string]keySetting
 }
 
-func newProvider(name string, keys []string) *provider {
+func newProvider(name string, keys []string, settings map[string]keySetting) *provider {
 	providerName := strings.TrimSpace(name)
 	if providerName == "" {
 		providerName = sdkaccess.DefaultAccessProviderName
@@ -42,7 +53,15 @@ func newProvider(name string, keys []string) *provider {
 	for _, key := range keys {
 		keySet[key] = struct{}{}
 	}
-	return &provider{name: providerName, keys: keySet}
+	settingsCopy := make(map[string]keySetting, len(settings))
+	for key, setting := range settings {
+		settingsCopy[key] = setting
+	}
+	return &provider{
+		name:     providerName,
+		keys:     keySet,
+		settings: settingsCopy,
+	}
 }
 
 func (p *provider) Identifier() string {
@@ -90,6 +109,9 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 			continue
 		}
 		if _, ok := p.keys[candidate.value]; ok {
+			if allowed, reason := p.allow(candidate.value); !allowed {
+				return nil, sdkaccess.NewInvalidCredentialErrorWithMessage(reason)
+			}
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
@@ -101,6 +123,76 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 	}
 
 	return nil, sdkaccess.NewInvalidCredentialError()
+}
+
+func (p *provider) allow(apiKey string) (bool, string) {
+	if p == nil || len(p.settings) == 0 {
+		return true, ""
+	}
+	setting, ok := p.settings[apiKey]
+	if !ok {
+		return true, ""
+	}
+	now := time.Now().UTC()
+	if !setting.expiresAt.IsZero() && now.After(setting.expiresAt) {
+		return false, "API key expired"
+	}
+	if setting.tokenLimit > 0 {
+		used := usageByAPIKey(apiKey)
+		if used >= setting.tokenLimit {
+			return false, "API key token quota exceeded"
+		}
+	}
+	return true, ""
+}
+
+func usageByAPIKey(apiKey string) int64 {
+	stats := usage.GetRequestStatistics()
+	if stats == nil {
+		return 0
+	}
+	snapshot := stats.Snapshot()
+	apiStats, ok := snapshot.APIs[apiKey]
+	if !ok {
+		return 0
+	}
+	return apiStats.TotalTokens
+}
+
+func normalizeKeySettings(entries []sdkconfig.APIKeySetting) map[string]keySetting {
+	if len(entries) == 0 {
+		return nil
+	}
+	settings := make(map[string]keySetting, len(entries))
+	for _, entry := range entries {
+		apiKey := strings.TrimSpace(entry.APIKey)
+		if apiKey == "" {
+			continue
+		}
+		if _, exists := settings[apiKey]; exists {
+			continue
+		}
+		if entry.TokenLimit < 0 {
+			continue
+		}
+		var expiresAt time.Time
+		expiresRaw := strings.TrimSpace(entry.ExpiresAt)
+		if expiresRaw != "" {
+			parsed, err := time.Parse(time.RFC3339, expiresRaw)
+			if err != nil {
+				continue
+			}
+			expiresAt = parsed.UTC()
+		}
+		if expiresAt.IsZero() && entry.TokenLimit == 0 {
+			continue
+		}
+		settings[apiKey] = keySetting{expiresAt: expiresAt, tokenLimit: entry.TokenLimit}
+	}
+	if len(settings) == 0 {
+		return nil
+	}
+	return settings
 }
 
 func extractBearerToken(header string) string {

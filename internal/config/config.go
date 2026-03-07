@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -621,6 +622,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
+	// Sanitize client API keys and attached policy settings.
+	cfg.SanitizeAPIKeys()
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -647,6 +651,88 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeAPIKeys trims and deduplicates api-keys and attached api-key-settings.
+// It also normalizes expires-at values to RFC3339 UTC and removes invalid settings.
+func (cfg *Config) SanitizeAPIKeys() {
+	if cfg == nil {
+		return
+	}
+
+	normalizedKeys := make([]string, 0, len(cfg.APIKeys))
+	seenKeys := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, key := range cfg.APIKeys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seenKeys[trimmed]; exists {
+			continue
+		}
+		seenKeys[trimmed] = struct{}{}
+		normalizedKeys = append(normalizedKeys, trimmed)
+	}
+	cfg.APIKeys = normalizedKeys
+
+	if len(cfg.APIKeySettings) == 0 {
+		return
+	}
+
+	normalizedSettings := make([]APIKeySetting, 0, len(cfg.APIKeySettings))
+	seenSettings := make(map[string]struct{}, len(cfg.APIKeySettings))
+	for _, setting := range cfg.APIKeySettings {
+		apiKey := strings.TrimSpace(setting.APIKey)
+		if apiKey == "" {
+			continue
+		}
+		if _, exists := seenKeys[apiKey]; !exists {
+			continue
+		}
+		if _, exists := seenSettings[apiKey]; exists {
+			continue
+		}
+
+		expiresAt, ok := normalizeAPIKeyExpiresAt(setting.ExpiresAt)
+		if !ok {
+			continue
+		}
+
+		tokenLimit := setting.TokenLimit
+		if tokenLimit < 0 {
+			continue
+		}
+		if tokenLimit == 0 && expiresAt == "" {
+			continue
+		}
+
+		normalizedSettings = append(normalizedSettings, APIKeySetting{
+			APIKey:     apiKey,
+			ExpiresAt:  expiresAt,
+			TokenLimit: tokenLimit,
+		})
+		seenSettings[apiKey] = struct{}{}
+	}
+
+	cfg.APIKeySettings = normalizedSettings
+}
+
+func normalizeAPIKeyExpiresAt(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", true
+	}
+
+	if ts, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return ts.UTC().Format(time.RFC3339), true
+	}
+
+	if day, err := time.Parse("2006-01-02", trimmed); err == nil {
+		ts := time.Date(day.Year(), day.Month(), day.Day(), 23, 59, 59, 0, time.UTC)
+		return ts.Format(time.RFC3339), true
+	}
+
+	return "", false
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

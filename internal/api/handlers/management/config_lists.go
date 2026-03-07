@@ -106,16 +106,58 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 
 // api-keys
 func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+
+func (h *Handler) GetAPIKeySettings(c *gin.Context) {
+	c.JSON(200, gin.H{"api-key-settings": h.cfg.APIKeySettings})
+}
+
+func (h *Handler) PutAPIKeySettings(c *gin.Context) {
+	var body struct {
+		Items []config.APIKeySetting `json:"items"`
+	}
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	if err = json.Unmarshal(data, &body.Items); err != nil {
+		if err2 := json.Unmarshal(data, &body); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+	}
+	h.cfg.APIKeySettings = append([]config.APIKeySetting(nil), body.Items...)
+	h.cfg.SanitizeAPIKeys()
+	h.persist(c)
+}
+
+func (h *Handler) DeleteAPIKeySettings(c *gin.Context) {
+	apiKey := strings.TrimSpace(c.Query("api-key"))
+	if apiKey == "" {
+		c.JSON(400, gin.H{"error": "missing api-key"})
+		return
+	}
+	out := make([]config.APIKeySetting, 0, len(h.cfg.APIKeySettings))
+	for _, setting := range h.cfg.APIKeySettings {
+		if strings.TrimSpace(setting.APIKey) != apiKey {
+			out = append(out, setting)
+		}
+	}
+	h.cfg.APIKeySettings = out
+	h.persist(c)
+}
+
 func (h *Handler) PutAPIKeys(c *gin.Context) {
 	h.putStringList(c, func(v []string) {
 		h.cfg.APIKeys = append([]string(nil), v...)
+		h.cfg.SanitizeAPIKeys()
 	}, nil)
 }
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	h.patchStringList(c, &h.cfg.APIKeys, func() { h.cfg.SanitizeAPIKeys() })
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	h.deleteFromStringList(c, &h.cfg.APIKeys, func() { h.cfg.SanitizeAPIKeys() })
 }
 
 // gemini-api-key: []GeminiKey

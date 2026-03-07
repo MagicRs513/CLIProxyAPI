@@ -70,6 +70,14 @@ func NewInvalidCredentialError() *AuthError {
 	return newAuthError(AuthErrorCodeInvalidCredential, "Invalid API key", http.StatusUnauthorized, nil)
 }
 
+func NewInvalidCredentialErrorWithMessage(message string) *AuthError {
+	normalized := strings.TrimSpace(message)
+	if normalized == "" {
+		normalized = "Invalid API key"
+	}
+	return newAuthError(AuthErrorCodeInvalidCredential, normalized, http.StatusUnauthorized, nil)
+}
+
 func NewNotHandledError() *AuthError {
 	return newAuthError(AuthErrorCodeNotHandled, "authentication provider did not handle request", 0, nil)
 }
