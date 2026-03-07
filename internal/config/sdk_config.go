@@ -20,6 +20,9 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
+	// APIKeySettings stores optional expiration and token quota limits per API key.
+	APIKeySettings []APIKeySetting `yaml:"api-key-settings,omitempty" json:"api-key-settings,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
@@ -30,6 +33,13 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// APIKeySetting defines policy constraints for a client API key.
+type APIKeySetting struct {
+	APIKey     string `yaml:"api-key" json:"api-key"`
+	ExpiresAt  string `yaml:"expires-at,omitempty" json:"expires-at,omitempty"`
+	TokenLimit int64  `yaml:"token-limit,omitempty" json:"token-limit,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.
